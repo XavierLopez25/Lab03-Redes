@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server","--requirepass","testpass"]
+    ports:
+      - "6379:6379"
