@@ -1,13 +1,16 @@
-# Lab3 – Simulador Redis Pub/Sub (Dijkstra)
+# Lab3 – Simulador Redis Pub/Sub (Dijkstra + LSR)
 
 Este simulador:
 
 * Carga una **topología** (formato `N1-N2:20, ...`).
-* Construye **tablas de next-hop** con **Dijkstra**.
+* **Dijkstra:** construye **tablas de next-hop** estáticas.
+* **LSR (Link State Routing):** inunda **LSPs** (Link-State Packets), mantiene una **LSDB**, y recalcula **SPF (Dijkstra)** dinámicamente en cada nodo.
 * Levanta un **router** por cada nodo (uno por canal de Redis).
 * Envía un **HELLO** y un **MESSAGE** de prueba de `--source` a `--dest`.
 
-> Por ahora, la flag `--proto` acepta `dijkstra|flooding|lsr|dvr`, pero **solo Dijkstra** está implementado (las otras se aceptan para dejar listo el CLI).
+> `--proto` acepta `dijkstra|lsr|flooding|dvr`.
+> Implementados: **dijkstra** (estático) y **lsr** (dinámico).
+> `flooding`/`dvr`: placeholders (por ahora caen en bootstrap Dijkstra).
 
 ---
 
@@ -17,7 +20,7 @@ Este simulador:
 * Docker + Docker Compose:
 
   * **Windows:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-  * **Linux:** Docker Engine y plugin `docker compose` (en distros nuevas viene incluido)
+  * **Linux:** Docker Engine y plugin `docker compose`
 * Dependencias Python (dentro de un venv):
 
   ```bash
@@ -26,22 +29,17 @@ Este simulador:
 
 ---
 
-## Estructura sugerida
+## Estructura
 
 ```
 .
 ├─ docker-compose.yml
 ├─ topology.txt
 └─ src/
-   ├─ simulator.py
-   ├─ topology.py
-   └─ dijkstra.py
+   ├─ simulator.py     # Dijkstra + LSR (LSP flood + LSDB + SPF)
+   ├─ topology.py      # parser de topología
+   └─ dijkstra.py      # dijkstra, build_next_hop, all_pairs_next_hops
 ```
-
-* `topology.txt` contiene la topología en texto (ejemplo al final).
-* `src/topology.py` tiene el parser.
-* `src/dijkstra.py` resuelve next-hops.
-* `src/simulator.py` corre los routers y publica mensajes.
 
 ---
 
@@ -49,25 +47,17 @@ Este simulador:
 
 ### Linux / macOS
 
-Para inicializar: 
 ```bash
 docker compose up -d
-```
-
-Para detener:
-```bash
+# parar rápido:
 docker rm -f lab03-redes-redis-1
 ```
 
 ### Windows (PowerShell)
 
-Para inicializar: 
 ```powershell
 docker compose up -d
-```
-
-Para detener:
-```powershell
+# parar rápido:
 docker rm -f lab03-redes-redis-1
 ```
 
@@ -95,16 +85,16 @@ pip install -r requirements.txt
 
 ---
 
-## Ejecución rápida (Dijkstra)
+## Ejecución rápida
 
-### A) Contra Redis local (Docker)
+### A) Dijkstra (estático)
 
 ```bash
 python3 src/simulator.py \
   --topology topology.txt \
   --source N3 \
   --dest N11 \
-  --text "Hola desde N3" \
+  --text "Hola desde Dijkstra 👋" \
   --proto dijkstra \
   --redis-host localhost \
   --redis-port 6379 \
@@ -113,54 +103,47 @@ python3 src/simulator.py \
   --prefix "sec30.grupo3"
 ```
 
-```powershell
-python.exe src/simulator.py --topology topology.txt --source N3 --dest N11 --text "Hola desde N3" --proto dijkstra --redis-host localhost --redis-port 6379 --redis-pwd testpass --group grupo3 --prefix "sec30.grupo3"
-```
-
-### B) Contra Redis Real
+### B) LSR (dinámico)
 
 ```bash
 python3 src/simulator.py \
   --topology topology.txt \
   --source N3 \
   --dest N11 \
-  --text "Test grupo3" \
-  --proto dijkstra \
-  --redis-host lab3.redesuvg.cloud \
+  --text "Hola desde LSR 👋" \
+  --proto lsr \
+  --redis-host localhost \
   --redis-port 6379 \
-  --redis-pwd UVGRedis2025 \
+  --redis-pwd testpass \
   --group grupo3 \
   --prefix "sec30.grupo3"
 ```
 
-```powershell
-python.exe src/simulator.py --topology topology.txt --source N3 --dest N11 --text "Test grupo3" --proto dijkstra --redis-host lab3.redesuvg.cloud --redis-port 6379 --redis-pwd UVGRedis2025 --group grupo3 --prefix "sec30.grupo3"
-```
-
-> ⚠️ **Importante**:
+> Con **LSR**, cada nodo:
 >
-> * `--group grupo3` hace que **cada router escuche** en canales `sec30.grupo3.nodoX`.
-> * `--prefix "sec30.grupo3"` hace que **publique** a `sec30.grupo3.nodoX`.
-> * Para que el simulador funcione internamente, **group y prefix deben coincidir** (a menos que tengas un motivo para separarlos y lo controles conscientemente).
+> * Inunda LSPs periódicamente (2s).
+> * Actualiza la **LSDB** al recibir LSPs nuevos (con control de `seq`).
+> * Reconstruye un grafo SPF a partir de la LSDB y corre **Dijkstra** local.
+> * Tus mensajes `message` usan la **tabla de next-hop** actualizada dinámicamente.
 
 ---
 
 ## Flags (referencia)
 
-| Flag           | Valor por defecto        | Descripción                                                                                |          |     |                                         |
-| -------------- | ------------------------ | ------------------------------------------------------------------------------------------ | -------- | --- | --------------------------------------- |
-| `--topology`   | `topology.txt`           | Ruta al archivo de topología (texto).                                                      |          |     |                                         |
-| `--source`     | `N3`                     | Nodo origen lógico (formato `N*`).                                                         |          |     |                                         |
-| `--dest`       | `N11`                    | Nodo destino lógico (formato `N*`).                                                        |          |     |                                         |
-| `--text`       | `Hola desde Dijkstra` | Payload del mensaje de usuario.                                                            |          |     |                                         |
-| `--ttl`        | `20`                     | TTL del mensaje.                                                                           |          |     |                                         |
-| `--runtime`    | `6.0`                    | Segundos que se mantiene corriendo la simulación (para ver hops).                          |          |     |                                         |
-| `--proto`      | `dijkstra`               | dijkstra/flooding/lsr/dvr (por ahora siempre usa Dijkstra). |
-| `--redis-host` | `localhost`              | Host de Redis.                                                                             |          |     |                                         |
-| `--redis-port` | `6379`                   | Puerto de Redis.                                                                           |          |     |                                         |
-| `--redis-pwd`  | `testpass`               | Password de Redis (en el Docker local).                                                    |          |     |                                         |
-| `--group`      | `sim`                    | Grupo para direcciones `sec30.<group>.nodoX` (routers **escuchan** aquí).                  |          |     |                                         |
-| `--prefix`     | `grupo3`                 | Prefijo alterno para **publicar** `sec30.<prefix>.nodoX`. Deja `grupo3` para sec30.grupo3. |          |     |                                         |
+| Flag           | Default        | Descripción                                                               |
+| -------------- | -------------- | ------------------------------------------------------------------------- |
+| `--topology`   | `topology.txt` | Archivo de topología (texto).                                             |
+| `--source`     | `N3`           | Nodo origen lógico (`N*`).                                                |
+| `--dest`       | `N11`          | Nodo destino lógico (`N*`).                                               |
+| `--text`       | `"Hola..."`    | Payload del mensaje de usuario.                                           |
+| `--ttl`        | `20`           | TTL del mensaje.                                                          |
+| `--runtime`    | `8.0`          | Segundos a mantener corriendo la simulación.                              |
+| `--proto`      | `dijkstra`     | `dijkstra`/`lsr`/`flooding`/`dvr` (implementados: dijkstra, lsr).         |
+| `--redis-host` | `localhost`    | Host Redis.                                                               |
+| `--redis-port` | `6379`         | Puerto Redis.                                                             |
+| `--redis-pwd`  | `testpass`     | Password Redis.                                                           |
+| `--group`      | `sim`          | Grupo para direcciones `sec30.<group>.nodoX` (routers **escuchan** aquí). |
+| `--prefix`     | `""`           | Prefijo alterno para **publicar** `sec30.<prefix>.nodoX`.                 |
 
 ### Variables de entorno equivalentes (opcional)
 
@@ -171,7 +154,7 @@ export REDIS_HOST=lab3.redesuvg.cloud
 export REDIS_PWD=UVGRedis2025
 export GROUP=grupo3
 export CHAN_PREFIX=grupo3
-python3 src/simulator.py --source N3 --dest N11
+python3 src/simulator.py --source N3 --dest N11 --proto lsr
 ```
 
 **Windows (PowerShell):**
@@ -181,23 +164,12 @@ $env:REDIS_HOST="lab3.redesuvg.cloud"
 $env:REDIS_PWD="UVGRedis2025"
 $env:GROUP="grupo3"
 $env:CHAN_PREFIX="grupo3"
-python src/simulator.py --source N3 --dest N11
+python src/simulator.py --source N3 --dest N11 --proto lsr
 ```
 
 ---
 
-## Canales y direcciones
-
-* Los campos `from` y `to` del mensaje usan la forma:
-  `sec30.<group>.nodo<NUM>` (ej. `sec30.grupo3.nodo3`).
-* Internamente, el simulador conoce el **id lógico** del nodo (`N3`) y lo convierte a/desde dirección (helpers `address_of` / `node_of`).
-* Los **headers** se envían como **lista de objetos** `[{k:v},{k2:v2}]`, y el simulador los enriquece con:
-
-  * `via` (el hop actual), `path` (lista de nodos recorridos), `cost` (costo acumulado).
-
----
-
-## Formato de topología (`topology.txt`)
+## Topología (ejemplo)
 
 ```
 N1-N2:20, N1-N3:14, N1-N5:17, N10-N5:8, N10-N6:7, N10-N7:7, N11-N2:1, N11-N4:10,
@@ -205,5 +177,7 @@ N11-N6:20, N2-N7:4, N3-N4:14, N3-N9:2, N4-N6:4, N4-N8:19, N4-N9:14, N5-N6:5, N5-
 N9:20, N6-N7:3, N6-N9:1, N8-N9:4
 ```
 
-El parser crea un grafo **no dirigido** con pesos. Dijkstra calcula **next-hops** para cada nodo hacia todos los destinos.
+El parser crea un grafo **no dirigido** con pesos.
 
+* **Dijkstra:** calcula **next-hops** estáticos.
+* **LSR:** reconstruye la topología vía LSPs y **recalcula** next-hops dinámicamente.

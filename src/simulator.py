@@ -65,7 +65,7 @@ class Router:
                  group: str,                      # para from/to addresses
                  prefix: str | None = None):      # opcional: prefijo alternativo
         self.me = me
-        self.next_hop_table = next_hop_table
+        self.next_hop_table = next_hop_table or {}
         self.graph = graph
         self.group = group
         self.prefix = prefix
@@ -74,10 +74,33 @@ class Router:
         # Canal de escucha ('group', escucha en sec30.<group>.nodoX)
         self.listen_channel = address_of(me, group)
 
+        # --- LSR state ---
+        self.lsdb: Dict[str, Dict[str, int]] = {}      # origin -> {neighbor: cost}
+        self.last_seq: Dict[str, int] = {}             # origin -> last seq seen
+        self.my_seq: int = 0                           # seq para mis LSPs
+        self.proto: str | None = None                  # se setea luego desde main
+        self.my_neighbors = dict(self.graph.get(self.me, {}))  # vecinos locales
+
+        # Bootstrap de next-hop por si aún no hay LSDB (evita "sin ruta")
+        try:
+            from dijkstra import dijkstra, build_next_hop
+            _, prev = dijkstra(self.graph, self.me)
+            boot = build_next_hop(self.me, prev)
+            # No pisar si ya venía algo desde arriba:
+            for k, v in (boot or {}).items():
+                self.next_hop_table.setdefault(k, v)
+        except Exception:
+            pass
+
     async def run(self):
         async with self.r.pubsub() as ps:
             await ps.subscribe(self.listen_channel)
             print(f"{self.me} listening on {self.listen_channel}")
+
+            # Tarea periódica de anuncios LSR:
+            if self.proto == "lsr":
+                asyncio.create_task(self._lsr_periodic_lsp())
+
             while True:
                 m = await ps.get_message(ignore_subscribe_messages=True, timeout=None)
                 if not m:
@@ -99,6 +122,13 @@ class Router:
         ch = self.publish_channel_for(node)
         await self.r.publish(ch, json.dumps(msg))
 
+    async def flood_to_neighbors(self, except_node: str | None, msg: dict):
+        # except_node usa ID lógico "N*"
+        for nbr in self.my_neighbors.keys():
+            if except_node and nbr == except_node:
+                continue
+            await self.publish(nbr, msg)
+
     async def handle(self, msg: dict):
         ttl = msg.get("ttl", 0)
         if ttl <= 0:
@@ -113,6 +143,8 @@ class Router:
         elif mtype == "echo":
             h = headers_to_dict(msg.get("headers"))
             print(f"[{self.me}] ECHO de {node_of(msg['from'])} headers={h}")
+        elif mtype == "info" and msg.get("proto") == "lsr":
+            await self.on_lsr_info(msg)
         else:
             print(f"[{self.me}] Tipo desconocido: {mtype}")
 
@@ -172,6 +204,92 @@ class Router:
         await self.publish(nh, fwd)
         print(f"[{self.me}] → {nh} (dest {dst_node}) path={path} cost={cost}")
 
+    # ---------- LSR ----------
+    async def _lsr_periodic_lsp(self):
+        # Envía un LSP cada 2 segundos (ajustable)
+        while True:
+            await asyncio.sleep(2.0)
+            await self._lsr_send_lsp()
+
+    async def _lsr_send_lsp(self):
+        self.my_seq += 1
+        payload = {
+            "origin": self.me,
+            "seq": self.my_seq,
+            "neighbors": self.my_neighbors  # dict: N* -> costo
+        }
+        lsp = make_msg(
+            proto="lsr",
+            mtype="info",
+            src_node=self.me,
+            dst_node=self.me,   # semántico; realmente floodeamos a vecinos
+            ttl=10,
+            payload=payload,
+            headers_list=[{"lsp": True}, {"path":[self.me]}],
+            group=self.group
+        )
+        await self.flood_to_neighbors(except_node=None, msg=lsp)
+        print(f"[{self.me}] LSP seq={self.my_seq} flooded to neighbors")
+
+    async def on_lsr_info(self, msg: dict):
+        # 1) Decode
+        try:
+            payload = msg.get("payload", {})
+            origin = payload["origin"]
+            seq = int(payload["seq"])
+            neighbors = dict(payload["neighbors"])
+        except Exception:
+            print(f"[{self.me}] LSP malformado, drop")
+            return
+
+        # 2) Duplicates / ordering
+        if self.last_seq.get(origin, -1) >= seq:
+            # viejo o duplicado
+            return
+        self.last_seq[origin] = seq
+
+        # 3) Update LSDB
+        self.lsdb[origin] = neighbors
+
+        # 4) Recompute SPF graph from LSDB
+        #    Construimos un grafo no dirigido a partir de todas las entradas
+        spf_graph: Dict[str, Dict[str, int]] = {}
+        for u, nbrs in self.lsdb.items():
+            spf_graph.setdefault(u, {})
+            for v, w in nbrs.items():
+                spf_graph.setdefault(v, {})
+                spf_graph[u][v] = w
+                spf_graph[v][u] = w
+
+        # Incluye mis vecinos si aún no hay suficiente info
+        if self.me not in spf_graph:
+            spf_graph[self.me] = dict(self.my_neighbors)
+
+        # 5) Run Dijkstra y actualiza tabla de next-hop
+        try:
+            from dijkstra import dijkstra, build_next_hop
+            _, prev = dijkstra(spf_graph, self.me)
+            self.next_hop_table = build_next_hop(self.me, prev)
+        except Exception as e:
+            print(f"[{self.me}] SPF error: {e}")
+
+        # 6) Flood onwards (except the neighbor it came from)
+        headers = headers_to_dict(msg.get("headers"))
+        path = list(headers.get("path", []))
+        last_hop = node_of(msg.get("from"))
+
+        if msg.get("ttl", 0) <= 1:
+            return
+        fwd = dict(msg)
+        fwd["ttl"] = msg.get("ttl", 0) - 1
+
+        if not path or path[-1] != self.me:
+            path.append(self.me)
+        headers.update({"via": self.me, "path": path})
+        fwd["headers"] = dict_to_headers(headers)
+
+        await self.flood_to_neighbors(except_node=last_hop, msg=fwd)
+
 # =========================
 # Main
 # =========================
@@ -180,13 +298,20 @@ async def main(args):
     # Cargar topología
     graph = load_topology_from_file(args.topology)
 
-    # Resolver next-hops según el proto (por ahora siempre Dijkstra)
-    if args.proto.lower() not in {"dijkstra", "flooding", "lsr", "dvr"}:
+    # Resolver según proto
+    proto = args.proto.lower()
+    if proto not in {"dijkstra", "flooding", "lsr", "dvr"}:
         raise SystemExit(f"--proto inválido: {args.proto}")
-    if args.proto.lower() != "dijkstra":
-        print(f"[warn] --proto={args.proto} aún no implementado; usando Dijkstra para next-hops.")
 
-    tables = all_pairs_next_hops(graph)  # { "N1": {"N2":"N2", ...}, ... }
+    tables = {}
+    if proto == "dijkstra":
+        tables = all_pairs_next_hops(graph)
+    elif proto == "lsr":
+        print("[info] LSR: next-hops se recalculan dinámicamente con LSDB (vía LSPs)")
+        # tables queda vacío; cada router arranca con bootstrap local
+    else:
+        print(f"[warn] --proto={args.proto} aún no implementado; usando bootstrap con Dijkstra")
+        tables = all_pairs_next_hops(graph)
 
     # Lanzar un router por cada nodo
     routers = [
@@ -202,6 +327,9 @@ async def main(args):
         )
         for n in graph.keys()
     ]
+    for r in routers:
+        r.proto = proto
+
     tasks = [asyncio.create_task(r.run()) for r in routers]
 
     # Pequeña pausa para asegurar suscripciones
@@ -241,20 +369,23 @@ async def main(args):
         t.cancel()
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Simulador Redis Pub/Sub con Dijkstra (headers como lista).")
+    p = argparse.ArgumentParser(description="Simulador Redis Pub/Sub con Dijkstra y LSR (headers como lista).")
     p.add_argument("--topology", default="topology.txt", help="Archivo de topología")
     p.add_argument("--source", default="N3", help="Nodo origen lógico (N*)")
     p.add_argument("--dest", default="N11", help="Nodo destino lógico (N*)")
-    p.add_argument("--text", default="Hola desde Dijkstra 👋", help="Mensaje de prueba (payload)")
+    p.add_argument("--text", default="Hola desde Dijkstra/LSR 👋", help="Mensaje de prueba (payload)")
     p.add_argument("--ttl", type=int, default=20, help="TTL del mensaje")
-    p.add_argument("--runtime", type=float, default=6.0, help="Segundos a mantener corriendo")
-    p.add_argument("--proto", default="dijkstra", help="Algoritmo: dijkstra|flooding|lsr|dvr (por ahora usa Dijkstra)")
+    p.add_argument("--runtime", type=float, default=8.0, help="Segundos a mantener corriendo")
+    p.add_argument("--proto", default="dijkstra", help="Algoritmo: dijkstra|flooding|lsr|dvr (lsr implementado)")
+
     # Conexión Redis
     p.add_argument("--redis-host", default=os.getenv("REDIS_HOST", "localhost"), help="Host Redis")
     p.add_argument("--redis-port", type=int, default=int(os.getenv("REDIS_PORT", "6379")), help="Puerto Redis")
     p.add_argument("--redis-pwd", default=os.getenv("REDIS_PWD", "testpass"), help="Password Redis")
+
     # Direccionamiento
     p.add_argument("--group", default=os.getenv("GROUP", "sim"), help="Grupo para from/to (sec30.<group>.nodoX)")
-    p.add_argument("--prefix", default=os.getenv("CHAN_PREFIX", ""), help="Prefijo alterno (si quieres publicar en sec30.<prefix>.nodoX). Vacío = usar group.")
+    p.add_argument("--prefix", default=os.getenv("CHAN_PREFIX", ""), help="Prefijo alterno para publicar (sec30.<prefix>.nodoX)")
+
     args = p.parse_args()
     asyncio.run(main(args))
