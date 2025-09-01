@@ -4,6 +4,7 @@ import redis.asyncio as redis
 
 from topology import load_topology_from_file
 from dijkstra import all_pairs_next_hops
+from flooding import FloodingStrategy
 
 # =========================
 # Helpers: addresses & headers
@@ -13,6 +14,11 @@ def address_of(node: str, group: str) -> str:
     # "N3" -> "sec30.<group>.nodo3"
     n = int(node[1:])
     return f"sec30.{group}.nodo{n}"
+
+def normalize_prefix(prefix: str | None) -> str | None:
+    if not prefix:
+        return None
+    return prefix if prefix.startswith("sec30.") else f"sec30.{prefix}"
 
 def node_of(address: str) -> str:
     # "sec30.<group>.nodo3" -> "N3"
@@ -68,8 +74,10 @@ class Router:
         self.next_hop_table = next_hop_table or {}
         self.graph = graph
         self.group = group
-        self.prefix = prefix
         self.r = redis.Redis(host=redis_host, port=redis_port, password=redis_pwd)
+        self.prefix = normalize_prefix(prefix)   
+        self.flood = FloodingStrategy()         
+        self.seen_ids: set[str] = set()          
 
         # Canal de escucha ('group', escucha en sec30.<group>.nodoX)
         self.listen_channel = address_of(me, group)
@@ -137,7 +145,11 @@ class Router:
 
         mtype = msg.get("type")
         if mtype == "message":
-            await self.on_message(msg)
+            proto = (msg.get("proto") or "dijkstra").lower()
+            if proto == "flooding":
+                await self.flood.handle_message(self, msg)
+            else:
+                await self.on_message(msg)
         elif mtype == "hello":
             await self.on_hello(msg)
         elif mtype == "echo":
@@ -306,6 +318,8 @@ async def main(args):
     tables = {}
     if proto == "dijkstra":
         tables = all_pairs_next_hops(graph)
+    elif proto == "flooding":
+        tables = {}
     elif proto == "lsr":
         print("[info] LSR: next-hops se recalculan dinámicamente con LSDB (vía LSPs)")
         # tables queda vacío; cada router arranca con bootstrap local
