@@ -2,6 +2,8 @@
 import os, json, asyncio, time, argparse, socket, re
 from typing import Dict, Any
 import redis.asyncio as redis
+from dotenv import load_dotenv
+load_dotenv()
 
 # ------------- Helpers de direcciones -----------------
 
@@ -104,7 +106,7 @@ class Node:
     def __init__(self, me: str, group: str, neighbors: Dict[str, int],
                  redis_host: str, redis_port: int, redis_pwd: str,
                  hello_period: int = 3, hello_misses: int = 10,
-                 remote_age: int = 30, stable_nochange: int = 10,
+                 remote_age: int = 60, stable_nochange: int = 100,
                  debug: bool = False):
         self.me = me
         self.group = group
@@ -198,7 +200,6 @@ class Node:
             await self._publish(address_for_dest(nbr, self.group), h)
 
     async def _forward_message_if_changed(self, msg: dict, changed: bool):
-        # Reenvía un "message" a TODOS mis vecinos vivos solo si hubo cambio
         if not changed:
             self.nochange_count += 1
             if self.nochange_count >= self.STABLE_NOCHANGE:
@@ -207,9 +208,11 @@ class Node:
             return
         self.nochange_count = 0
         live = self._live_neighbors()
+        if self.debug:
+            print(f"[{self.me}] FORWARD {msg.get('from')} -> {msg.get('to')} a vecinos {live}")
         for out in live:
-            # >>> cambio: reenviar al canal del DESTINO (vecino)
             await self._publish(address_for_dest(out, self.group), msg)
+
 
     # -------- recepción --------
 
@@ -224,8 +227,9 @@ class Node:
 
         # Si no es vecino configurado, ignoro (o podría registrarlo)
         if frm not in self.topo.get(self.me, {}):
-            # opcional: auto-registrar como vecino con ese peso
-            # self.topo[self.me][frm] = {"weight": w, "time": self.HELLO_MISSES}
+            self.topo.setdefault(self.me, {})[frm] = {"weight": w, "time": self.HELLO_MISSES}
+            self.topo.setdefault(frm, {})[self.me] = {"weight": w}
+            await self._flood_my_adjacencies()
             return
 
         # Actualiza peso si cambió y resetea timer
@@ -247,7 +251,16 @@ class Node:
         # Mensaje con adyacencia (u --w--> v). Es *contenido*, no destino.
         u = node_of(msg["from"])
         v = node_of(msg["to"])
-        w = int(msg.get("hops", 1))
+        raw = msg.get("hops")
+        if raw is None:  # aceptar otros nombres por compatibilidad
+            raw = msg.get("weight", msg.get("w"))
+
+        try:
+            w = int(raw)
+        except (TypeError, ValueError):
+            if self.debug:
+                print(f"[{self.me}] Descarto mensaje por 'hops' inválido: {msg}")
+            return
 
         # Asegurar nodos
         self._ensure_node(u)
@@ -321,7 +334,7 @@ class Node:
                             to_del.append((u, v))
             if to_del:
                 for (u, v) in to_del:
-                    # print(f"[{self.me}] Expiró adyacencia remota {u}-{v}")
+                    print(f"[{self.me}] Expiró adyacencia remota {u}-{v}")
                     self.topo[u].pop(v, None)
                 # No hace falta floodear "borrados" remotos según instrucción;
                 # cada nodo envejece de forma independiente.
@@ -403,7 +416,7 @@ async def preflight_redis(host: str, port: int, pwd: str):
         raise SystemExit(f"[preflight] DNS no pudo resolver {host}:{port} → {e}")
 
     try:
-        test = redis.Redis(host=host, port=port, password=pwd, socket_connect_timeout=5)
+        test = redis.Redis(host=host, port=port, password=pwd, socket_connect_timeout=30)
         pong = await test.ping()
         if pong is not True:
             raise SystemExit("[preflight] Redis respondió algo distinto a PONG")
@@ -422,8 +435,8 @@ async def main():
     p.add_argument("--redis-pwd",  default=os.getenv("REDIS_PWD", "testpass"))
     p.add_argument("--hello-period", type=int, default=3)
     p.add_argument("--hello-misses", type=int, default=10)
-    p.add_argument("--remote-age", type=int, default=30)
-    p.add_argument("--stable-nochange", type=int, default=10)
+    p.add_argument("--remote-age", type=int, default=3000)
+    p.add_argument("--stable-nochange", type=int, default=25)
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
